@@ -13,6 +13,9 @@ MOVES = ("Rock", "Paper", "Scissors")
 STABLE_FRAMES = 8
 ROUND_COOLDOWN = 0.7
 
+# Reject hand detections below this score (from MediaPipe handedness classification).
+MIN_HAND_CLASSIFICATION_SCORE = 0.65
+
 
 @dataclass
 class GameState:
@@ -42,22 +45,92 @@ class GameState:
 # ------------------ Gesture Detection ------------------ #
 
 def finger_up(lm, tip, pip):
+    """Non-thumb fingers: extended if tip is above pip (smaller y in image space)."""
     return lm[tip].y < lm[pip].y
 
 
-def detect_gesture(lm):
-    index = finger_up(lm, 8, 6)
-    middle = finger_up(lm, 12, 10)
-    ring = finger_up(lm, 16, 14)
-    pinky = finger_up(lm, 20, 18)
+def thumb_extended(lm, handedness_label: str) -> bool:
+    """
+    Thumb "up" uses horizontal spread vs IP joint (thumb differs from other fingers).
+    handedness_label is MediaPipe's "Left" or "Right" for the detected hand.
+    """
+    if handedness_label == "Right":
+        return lm[4].x < lm[3].x
+    return lm[4].x > lm[3].x
 
-    if index and middle and not ring and not pinky:
+
+def count_raised_fingers(lm, handedness_label: str) -> int:
+    """
+    Explicit count of raised digits (thumb + index + middle + ring + pinky).
+    Used as the only signal for Rock / Paper / Scissors — no fallback shapes.
+    """
+    n = 0
+    if thumb_extended(lm, handedness_label):
+        n += 1
+    for tip, pip in ((8, 6), (12, 10), (16, 14), (20, 18)):
+        if finger_up(lm, tip, pip):
+            n += 1
+    return n
+
+
+def gesture_from_finger_count(finger_count: int):
+    """
+    Strict mapping only — invalid counts never map to a nearby move.
+
+    Rock: closed fist (0 extended fingers).
+    Scissors: exactly two extended fingers (typ. index + middle).
+    Paper: all five extended.
+    """
+    if finger_count == 0:
+        return "Rock"
+    if finger_count == 2:
         return "Scissors"
-
-    if index and middle and ring and pinky:
+    if finger_count == 5:
         return "Paper"
+    return None
 
-    return "Rock"
+
+def detect_gesture(lm, handedness_label: str):
+    """
+    Classify a single hand from landmarks + handedness (for thumb rule).
+    Returns a valid move name or None if finger count is not exactly 0, 2, or 5.
+    """
+    count = count_raised_fingers(lm, handedness_label)
+    return gesture_from_finger_count(count)
+
+
+def classify_frame_gesture(res):
+    """
+    Full-frame validation: multi-hand guard, confidence, then strict finger count.
+
+    Returns:
+        valid_move: "Rock" | "Paper" | "Scissors" | None (never a fake move).
+        ui_primary: Short line for HUD (move, error, or invalid).
+        ui_hint: Secondary line ("Show only Rock, Paper, or Scissors" when invalid).
+    """
+    landmarks_list = res.multi_hand_landmarks
+    if not landmarks_list:
+        return None, "No hand", ""
+
+    if len(landmarks_list) > 1:
+        # Deliberately do not classify when more than one hand is in frame.
+        return None, "Error: Multiple hands detected", "Show only one hand"
+
+    # Optional: filter uncertain detections using handedness classification score.
+    if res.multi_handedness:
+        score = res.multi_handedness[0].classification[0].score
+        if score < MIN_HAND_CLASSIFICATION_SCORE:
+            return None, "Uncertain detection", "Hold your hand steady"
+
+    lm = landmarks_list[0].landmark
+    label = res.multi_handedness[0].classification[0].label if res.multi_handedness else "Right"
+    move = detect_gesture(lm, label)
+
+    if move is None:
+        # Any count other than 0, 2, or 5 is invalid — no nearest-gesture fallback.
+        return None, "Invalid Gesture", "Show only Rock, Paper, or Scissors"
+
+    return move, move, ""
 
 
 def stability(state, gesture):
@@ -110,7 +183,8 @@ def main():
     state = GameState()
 
     mp_hands = mp.solutions.hands
-    hands = mp_hands.Hands(max_num_hands=1)
+    # Need >1 so we can detect two hands and refuse to classify (strict multi-hand rule).
+    hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.6, min_tracking_confidence=0.5)
     mp_draw = mp.solutions.drawing_utils
 
     cap = cv2.VideoCapture(0)
@@ -118,6 +192,8 @@ def main():
     user_disp = "--"
     ai_disp = "--"
     result_disp = "--"
+    gesture_status = "No hand"
+    gesture_hint = ""
 
     while True:
         ret, frame = cap.read()
@@ -182,12 +258,14 @@ def main():
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         res = hands.process(rgb)
 
-        gesture = None
+        gesture, gesture_status, gesture_hint = classify_frame_gesture(res)
 
         if res.multi_hand_landmarks:
-            lm = res.multi_hand_landmarks[0].landmark
-            gesture = detect_gesture(lm)
-            mp_draw.draw_landmarks(frame, res.multi_hand_landmarks[0], mp_hands.HAND_CONNECTIONS)
+            if len(res.multi_hand_landmarks) > 1:
+                for hand_landmarks in res.multi_hand_landmarks:
+                    mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            else:
+                mp_draw.draw_landmarks(frame, res.multi_hand_landmarks[0], mp_hands.HAND_CONNECTIONS)
 
         stable_gesture = stability(state, gesture)
 
@@ -232,13 +310,20 @@ def main():
         cv2.putText(frame, f"User: {state.score_user}  AI: {state.score_ai}", (10, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
 
+        hud_move_color = (0, 255, 0) if gesture is not None else (0, 165, 255)
         cv2.putText(frame, f"Your Move: {user_disp}", (10, 110),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
 
-        cv2.putText(frame, f"AI Move: {ai_disp}", (10, 150),
+        cv2.putText(frame, f"Gesture: {gesture_status}", (10, 135),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, hud_move_color, 2)
+        if gesture_hint:
+            cv2.putText(frame, gesture_hint, (10, 162),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+
+        cv2.putText(frame, f"AI Move: {ai_disp}", (10, 192),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
 
-        cv2.putText(frame, f"Result: {result_disp}", (10, 190),
+        cv2.putText(frame, f"Result: {result_disp}", (10, 232),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
 
         cv2.imshow("RPS AI", frame)
