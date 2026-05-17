@@ -145,6 +145,7 @@ The game offers three distinct AI strategies that scale in complexity:
 
 ## 🔍 Technical Deep Dive
 
+
 ### Hand Landmark Detection
 
 MediaPipe Hands detects **21 landmarks** per hand:
