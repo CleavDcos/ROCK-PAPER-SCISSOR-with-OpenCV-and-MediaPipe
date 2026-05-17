@@ -92,30 +92,6 @@ The game offers three distinct AI strategies that scale in complexity:
 
 ---
 
-## 🚀 Installation & Setup
-
-### 1. Clone or Download the Repository
-
-```bash
-git clone https://github.com/your-username/ROCK-PAPER-SCISSOR-with-OpenCV-and-MediaPipe.git
-cd ROCK-PAPER-SCISSOR-with-OpenCV-and-MediaPipe
-```
-
-Or simply download the project files into a directory.
-
-### 2. Create a Virtual Environment (Recommended)
-
-**Windows (PowerShell/CMD):**
-```bash
-python -m venv venv
-venv\Scripts\activate
-
-# macOS / Linux
-python3 -m venv venv
-source venv/bin/activate
-```
-
-
 ## 🕹️ Controls
 
 ### Start Screen
